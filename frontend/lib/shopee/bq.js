@@ -435,8 +435,8 @@ INNER JOIN (
   SELECT order_sn, escrow_amount, completed_date
   FROM ${financeTable}
   WHERE shop_id = @shopId
-    AND DATE(completed_date AT TIME ZONE 'Asia/Jakarta') >= @fromDate
-    AND DATE(completed_date AT TIME ZONE 'Asia/Jakarta') <= @toDate
+    AND DATE(completed_date, 'Asia/Jakarta') >= @fromDate
+    AND DATE(completed_date, 'Asia/Jakarta') <= @toDate
 ) f ON o.order_id = f.order_sn`;
 
   const safeFrom   = fromDate.replace(/[^0-9-]/g, '');
@@ -463,10 +463,10 @@ INNER JOIN (
 
 /** Whitelisted SQL fragments for trend bucketing — never interpolate `granularity` directly. */
 const TREND_PERIOD_EXPR = {
-  daily:   "FORMAT_TIMESTAMP('%Y-%m-%d', f.completed_date AT TIME ZONE 'Asia/Jakarta')",
-  weekly:  "FORMAT_DATE('%G-W%V', DATE(f.completed_date AT TIME ZONE 'Asia/Jakarta'))",
-  monthly: "FORMAT_TIMESTAMP('%Y-%m', f.completed_date AT TIME ZONE 'Asia/Jakarta')",
-  yearly:  "FORMAT_TIMESTAMP('%Y', f.completed_date AT TIME ZONE 'Asia/Jakarta')",
+  daily:   "FORMAT_TIMESTAMP('%Y-%m-%d', f.completed_date , 'Asia/Jakarta')",
+  weekly:  "FORMAT_DATE('%G-W%V', DATE(f.completed_date , 'Asia/Jakarta'))",
+  monthly: "FORMAT_TIMESTAMP('%Y-%m', f.completed_date , 'Asia/Jakarta')",
+  yearly:  "FORMAT_TIMESTAMP('%Y', f.completed_date , 'Asia/Jakarta')",
 };
 
 /** Revenue/order/item trend bucketed by `granularity` for orders completed within [fromDate, toDate] (inclusive, 'YYYY-MM-DD'). */
@@ -494,8 +494,8 @@ INNER JOIN (
   SELECT order_sn, escrow_amount, completed_date
   FROM ${financeTable}
   WHERE shop_id = @shopId
-    AND DATE(completed_date AT TIME ZONE 'Asia/Jakarta') >= @fromDate
-    AND DATE(completed_date AT TIME ZONE 'Asia/Jakarta') <= @toDate
+    AND DATE(completed_date, 'Asia/Jakarta') >= @fromDate
+    AND DATE(completed_date, 'Asia/Jakarta') <= @toDate
 ) f ON o.order_id = f.order_sn
 GROUP BY period
 ORDER BY period ASC`;
