@@ -1,17 +1,17 @@
-import crypto from 'crypto';
-import { getDb }         from '../../lib/firebase.js';
-import { getBigQuery }   from '../../lib/bigquery.js';
-import { FieldValue }    from 'firebase-admin/firestore';
-import { getValidToken } from '../../lib/shopee/getValidToken.js';
-import { shopeeGet, shopeePost } from '../../lib/shopee/api.js';
-import {
+const crypto          = require('crypto');
+const { getDb }       = require('../../lib/firebase.js');
+const { getBigQuery } = require('../../lib/bigquery.js');
+const { FieldValue }  = require('firebase-admin/firestore');
+const { getValidToken }  = require('../../lib/shopee/getValidToken.js');
+const { shopeeGet, shopeePost } = require('../../lib/shopee/api.js');
+const {
   syncShopeeProducts,
   syncShopeeWallet, syncShopeeTransactions, syncShopeeEscrow,
   syncShopeeAnalytics,
   upsertShopeeOrderRows,
   getFinancialSummary, getFinancialTrend, getRevenueBySku,
-} from '../../lib/shopee/bq.js';
-import { flattenOrderToRows, runEscrowBackfill } from '../../lib/shopee/sync.js';
+} = require('../../lib/shopee/bq.js');
+const { flattenOrderToRows, runEscrowBackfill } = require('../../lib/shopee/sync.js');
 
 const SHOPEE_USER_ID = 'test_user'; // hardcoded until Phase 1.5 multi-tenant
 
@@ -27,7 +27,7 @@ async function _logSync(type, recordsSynced, errorMessage = null) {
   } catch (e) { console.warn('[Shopee sync] log write failed:', e.message); }
 }
 
-export default async function handler(req, res) {
+module.exports = async function handler(req, res) {
   const { resource } = req.query;
 
   if (resource === 'status') {
