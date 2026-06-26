@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { getDb }         from '../../lib/firebase.js';
+import { getBigQuery }   from '../../lib/bigquery.js';
 import { FieldValue }    from 'firebase-admin/firestore';
 import { getValidToken } from '../../lib/shopee/getValidToken.js';
 import { shopeeGet, shopeePost } from '../../lib/shopee/api.js';
@@ -517,9 +518,52 @@ export default async function handler(req, res) {
       const out_of_stock = invList.filter(i => (i.current_stock ?? 0) <= 0).map(i => ({ sku: i.sku, name: i.name ?? i.nama_produk, shopee_qty: i.shopee_qty ?? 0, tiktok_qty: i.tiktok_qty ?? 0 }));
       const low_stock    = invList.filter(i => (i.current_stock ?? 0) > 0 && (i.current_stock ?? 0) <= (i.min_stock ?? 0)).map(i => ({ sku: i.sku, name: i.name ?? i.nama_produk, current_stock: i.current_stock, min_stock: i.min_stock }));
 
+      // ── BigQuery: escrow released in period (matches Shopee Seller Center) ──
+      // Shopee shows "released" = escrow paid out to wallet, keyed by completed_date.
+      // This differs from order total_amount (gross, keyed by create_time).
+      let escrow_released = 0, escrow_order_count = 0;
+      try {
+        const bq      = getBigQuery();
+        const project = process.env.FIREBASE_PROJECT_ID;
+        const WIB_MS  = 7 * 3600 * 1000;
+        let utcFrom;
+        if (period === 'month') {
+          const wibNow = new Date(Date.now() + WIB_MS);
+          wibNow.setUTCDate(1); wibNow.setUTCHours(0, 0, 0, 0);
+          utcFrom = new Date(wibNow.getTime() - WIB_MS).toISOString();
+        } else {
+          utcFrom = new Date(Date.now() - Number(period) * 86400 * 1000).toISOString();
+        }
+        const utcTo = new Date().toISOString();
+        const [bqRows] = await bq.query({
+          query: `
+            SELECT IFNULL(SUM(escrow_amount),0) AS total_escrow, COUNT(*) AS order_count
+            FROM \`${project}.mystocks.shopee_order_finance\`
+            WHERE shop_id = '${String(shop_id)}'
+              AND completed_date >= TIMESTAMP('${utcFrom}')
+              AND completed_date <= TIMESTAMP('${utcTo}')
+          `,
+          location: 'asia-southeast2',
+        });
+        if (bqRows.length > 0) {
+          escrow_released    = Number(bqRows[0].total_escrow  ?? 0);
+          escrow_order_count = Number(bqRows[0].order_count   ?? 0);
+        }
+        console.log(`[shopee/summary] escrow_released=${escrow_released} for ${escrow_order_count} orders (${utcFrom} → ${utcTo})`);
+      } catch (e) {
+        console.warn('[shopee/summary] BQ escrow query failed:', e.message);
+      }
+
       return res.status(200).json({
         period,
-        revenue: { total: revenue, order_count: orders.length, avg_order: orders.length ? Math.round(revenue / orders.length) : 0, completed_pct },
+        revenue: {
+          total:              revenue,
+          order_count:        orders.length,
+          avg_order:          orders.length ? Math.round(revenue / orders.length) : 0,
+          completed_pct,
+          escrow_released,
+          escrow_order_count,
+        },
         orders_by_status,
         top_products,
         stock_alerts: { out_of_stock, low_stock },

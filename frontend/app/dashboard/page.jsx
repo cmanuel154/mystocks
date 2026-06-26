@@ -104,7 +104,12 @@ export default function DashboardPage() {
           </div>
         ) : (
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <StatCard label="Total Revenue"     value={fmtRp(rev.total)}      sub={`${fmtNum(rev.order_count)} pesanan`} icon="💰" color="pink" />
+            <StatCard
+              label="Diterima ke Dompet"
+              value={fmtRp(rev.escrow_released ?? 0)}
+              sub={rev.escrow_order_count ? `${fmtNum(rev.escrow_order_count)} pesanan selesai` : 'dari Shopee Escrow'}
+              icon="💰" color="pink"
+            />
             <StatCard label="Total Pesanan"     value={fmtNum(rev.order_count)} sub={`${period === 'month' ? 'Bulan ini' : period + ' hari terakhir'}`} icon="📦" color="blue" />
             <StatCard label="Rata-rata Pesanan" value={fmtRp(rev.avg_order)}   sub="per transaksi" icon="📊" color="purple" />
             <StatCard label="Pesanan Selesai"   value={`${rev.completed_pct ?? 0}%`} sub={`dari ${fmtNum(rev.order_count)} pesanan`} icon="✅" color="green" />
