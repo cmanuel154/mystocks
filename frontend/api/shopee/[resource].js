@@ -267,7 +267,6 @@ module.exports = async function handler(req, res) {
 
       console.log('[Shopee sync-orders] total orders to MERGE into BQ:', orders.length);
       const rows = orders.flatMap(o => flattenOrderToRows(o, shop_id));
-      const orderSns = orders.map(o => o.order_sn);
       const count = await upsertShopeeOrderRows(rows, orderSns);
       await _logSync('orders', count);
       return res.status(200).json({ success: true, records_synced: count });
