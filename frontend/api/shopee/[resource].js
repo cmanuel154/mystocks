@@ -5,10 +5,13 @@ import { FieldValue }    from 'firebase-admin/firestore';
 import { getValidToken } from '../../lib/shopee/getValidToken.js';
 import { shopeeGet, shopeePost } from '../../lib/shopee/api.js';
 import {
-  syncShopeeOrders, syncShopeeProducts,
+  syncShopeeProducts,
   syncShopeeWallet, syncShopeeTransactions, syncShopeeEscrow,
   syncShopeeAnalytics,
+  upsertShopeeOrderRows,
+  getFinancialSummary, getFinancialTrend, getRevenueBySku,
 } from '../../lib/shopee/bq.js';
+import { flattenOrderToRows, runEscrowBackfill } from '../../lib/shopee/sync.js';
 
 const SHOPEE_USER_ID = 'test_user'; // hardcoded until Phase 1.5 multi-tenant
 
@@ -263,7 +266,9 @@ export default async function handler(req, res) {
       }
 
       console.log('[Shopee sync-orders] total orders to MERGE into BQ:', orders.length);
-      const count = await syncShopeeOrders(orders, shop_id, SHOPEE_USER_ID);
+      const rows = orders.flatMap(o => flattenOrderToRows(o, shop_id));
+      const orderSns = orders.map(o => o.order_sn);
+      const count = await upsertShopeeOrderRows(rows, orderSns);
       await _logSync('orders', count);
       return res.status(200).json({ success: true, records_synced: count });
     } catch (err) {
@@ -858,6 +863,220 @@ export default async function handler(req, res) {
         result_list: data?.response?.result_list ?? [],
       });
     } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── GET /api/shopee/financial?from=YYYY-MM-DD&to=YYYY-MM-DD&granularity=monthly ─
+  if (resource === 'financial') {
+    const { from, to, granularity = 'monthly' } = req.query;
+    if (!from || !to) return res.status(400).json({ error: 'from and to required (YYYY-MM-DD)' });
+    try {
+      const { shop_id } = await getValidToken(SHOPEE_USER_ID);
+      const [summary, trend] = await Promise.all([
+        getFinancialSummary(shop_id, from, to),
+        getFinancialTrend(shop_id, from, to, granularity),
+      ]);
+      return res.status(200).json({ ...summary, trend });
+    } catch (err) {
+      console.error('[financial] error:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── GET /api/shopee/product-performance?from=...&to=... ───────────────────────
+  if (resource === 'product-performance') {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ error: 'from and to required (YYYY-MM-DD)' });
+    try {
+      const { shop_id } = await getValidToken(SHOPEE_USER_ID);
+      const data = await getRevenueBySku(shop_id, from, to);
+      return res.status(200).json({ data });
+    } catch (err) {
+      console.error('[product-performance] error:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── GET /api/shopee/stock-velocity?from=...&to=... ────────────────────────────
+  if (resource === 'stock-velocity') {
+    const { from, to } = req.query;
+    if (!from || !to) return res.status(400).json({ error: 'from and to required (YYYY-MM-DD)' });
+    try {
+      const { shop_id } = await getValidToken(SHOPEE_USER_ID);
+      const data = await getRevenueBySku(shop_id, from, to);
+      return res.status(200).json({ data });
+    } catch (err) {
+      console.error('[stock-velocity] error:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── GET /api/shopee/sync-escrow-backfill ─────────────────────────────────────
+  if (resource === 'sync-escrow-backfill') {
+    try {
+      const { access_token, shop_id } = await getValidToken(SHOPEE_USER_ID);
+      const result = await runEscrowBackfill(access_token, shop_id, 50);
+      return res.status(200).json({ success: true, ...result });
+    } catch (err) {
+      console.error('[sync-escrow-backfill] error:', err.message);
+      return res.status(500).json({ success: false, error: err.message });
+    }
+  }
+
+  // ── TEMPORARY: GET /api/shopee/debug-finance?date=YYYY-MM-DD ────────────────
+  // Diagnose UTC vs WIB discrepancy: compares Shopee escrow API vs BigQuery for a given WIB date.
+  if (resource === 'debug-finance') {
+    res.setHeader('Cache-Control', 'no-store');
+    const targetDate = req.query.date ?? '2026-06-01';
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate))
+      return res.status(400).json({ error: 'date must be YYYY-MM-DD' });
+    try {
+      const { access_token, shop_id } = await getValidToken(SHOPEE_USER_ID);
+
+      // ── 1. Shopee API: get_escrow_list for the WIB day window ─────────────
+      const dayStart = Math.floor(new Date(`${targetDate}T00:00:00+07:00`).getTime() / 1000);
+      const dayEnd   = dayStart + 86400;
+      console.log('[debug-finance] Shopee window (UTC):', new Date(dayStart * 1000).toISOString(), '→', new Date(dayEnd * 1000).toISOString());
+
+      let shopeeRows = [], shopeeTotal = 0;
+      try {
+        let pageNo = 1, more = true;
+        while (more && pageNo <= 10) {
+          const d = await shopeeGet('/api/v2/payment/get_escrow_list', {
+            release_time_from: dayStart, release_time_to: dayEnd, page_size: 100, page_no: pageNo,
+          }, access_token, shop_id);
+          const list = d?.response?.escrow_list ?? [];
+          shopeeRows = shopeeRows.concat(list.map(e => ({
+            order_sn: e.order_sn, payout_amount: e.payout_amount,
+            release_time_utc: e.escrow_release_time ? new Date(e.escrow_release_time * 1000).toISOString() : null,
+          })));
+          shopeeTotal += list.reduce((s, e) => s + Number(e.payout_amount ?? 0), 0);
+          more = d?.response?.more === true;
+          pageNo++;
+        }
+      } catch (e) { console.error('[debug-finance] Shopee failed:', e.message); }
+
+      // ── 2. BigQuery: shopee_order_finance diagnostic ──────────────────────────
+      const bq      = getBigQuery();
+      const project = process.env.FIREBASE_PROJECT_ID;
+      const ft      = `\`${project}.mystocks.shopee_order_finance\``;
+      const utcDate     = targetDate;
+      const prevUtcDate = new Date(new Date(`${targetDate}T00:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10);
+      const safeShop    = String(shop_id).replace(/[^0-9]/g, '');
+
+      console.log('[debug-finance] shop_id from token:', shop_id, '| safeShop:', safeShop);
+      console.log('[debug-finance] scanning UTC dates:', prevUtcDate, 'and', utcDate);
+
+      // 2a. Total row count and distinct shop_ids — tells us if table has data at all
+      let tableStats = {};
+      try {
+        const statsQuery = `
+          SELECT
+            COUNT(*) AS total_rows,
+            COUNT(DISTINCT shop_id) AS distinct_shops,
+            STRING_AGG(DISTINCT shop_id ORDER BY shop_id) AS shop_ids,
+            MIN(DATE(completed_date)) AS earliest_date,
+            MAX(DATE(completed_date)) AS latest_date
+          FROM ${ft}`;
+        console.log('[debug-finance] stats query:', statsQuery);
+        const [sJob] = await bq.createQueryJob({ query: statsQuery, location: 'asia-southeast2' });
+        const [sRows] = await sJob.getQueryResults();
+        const s = sRows[0] ?? {};
+        tableStats = {
+          total_rows:      Number(s.total_rows ?? 0),
+          distinct_shops:  Number(s.distinct_shops ?? 0),
+          shop_ids:        s.shop_ids ?? '',
+          earliest_date:   s.earliest_date?.value ?? s.earliest_date ?? null,
+          latest_date:     s.latest_date?.value   ?? s.latest_date   ?? null,
+        };
+        console.log('[debug-finance] table stats:', JSON.stringify(tableStats));
+      } catch (e) { console.error('[debug-finance] stats query failed:', e.message); tableStats = { error: e.message }; }
+
+      // 2b. Look up BQ rows by order_sn (not date) — reveals backfill-date corruption
+      // If rows exist but have wrong completed_date (e.g. sync time instead of release time),
+      // the date filter would return 0 but this lookup still finds them.
+      let bqRows = [], bqTotalUtc = 0, bqTotalWib = 0, bqRowCountUtc = 0, bqRowCountWib = 0, lastSyncedAt = null;
+      let bqDateMismatch = []; // rows whose wib_date ≠ targetDate — confirms backfill bug
+      try {
+        const snList = shopeeRows.map(r => `'${String(r.order_sn).replace(/'/g, '')}'`).join(',');
+        const bqQuery = snList.length
+          ? `SELECT order_sn, escrow_amount,
+               FORMAT_TIMESTAMP('%Y-%m-%d', completed_date)                             AS utc_date,
+               FORMAT_TIMESTAMP('%Y-%m-%d', completed_date, 'Asia/Jakarta') AS wib_date,
+               FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', synced_at)                       AS synced_at_str
+             FROM ${ft}
+             WHERE shop_id = '${safeShop}'
+               AND order_sn IN (${snList})
+             ORDER BY completed_date ASC`
+          : `SELECT order_sn, escrow_amount,
+               FORMAT_TIMESTAMP('%Y-%m-%d', completed_date)                             AS utc_date,
+               FORMAT_TIMESTAMP('%Y-%m-%d', completed_date, 'Asia/Jakarta') AS wib_date,
+               FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', synced_at)                       AS synced_at_str
+             FROM ${ft}
+             WHERE shop_id = '${safeShop}'
+               AND DATE(completed_date, 'Asia/Jakarta') = DATE('${utcDate}')
+             ORDER BY completed_date ASC`;
+        console.log('[debug-finance] order_sn lookup query (first 500 chars):', bqQuery.slice(0, 500));
+        const [job] = await bq.createQueryJob({ query: bqQuery, location: 'asia-southeast2' });
+        const [rows] = await job.getQueryResults();
+        bqRows = rows.map(r => ({
+          order_sn: r.order_sn, escrow_amount: Number(r.escrow_amount ?? 0),
+          utc_date: r.utc_date, wib_date: r.wib_date,
+          synced_at: r.synced_at_str ?? null,
+        }));
+        bqTotalUtc    = bqRows.filter(r => r.utc_date === utcDate).reduce((s, r) => s + r.escrow_amount, 0);
+        bqTotalWib    = bqRows.filter(r => r.wib_date === targetDate).reduce((s, r) => s + r.escrow_amount, 0);
+        bqRowCountUtc = bqRows.filter(r => r.utc_date === utcDate).length;
+        bqRowCountWib = bqRows.filter(r => r.wib_date === targetDate).length;
+        bqDateMismatch = bqRows.filter(r => r.wib_date !== targetDate)
+          .map(r => ({ order_sn: r.order_sn, stored_wib_date: r.wib_date, synced_at: r.synced_at }));
+        const syncs = bqRows.map(r => r.synced_at).filter(Boolean).sort();
+        lastSyncedAt = syncs[syncs.length - 1] ?? null;
+        console.log('[debug-finance] BQ lookup found', bqRows.length, 'rows;', bqDateMismatch.length, 'with wrong wib_date');
+      } catch (e) { console.error('[debug-finance] BQ order_sn query failed:', e.message, e.stack); }
+
+      // ── 3. Firestore webhook persistence sample ────────────────────────────
+      const webhookChecks = await Promise.all(shopeeRows.slice(0, 3).map(async r => {
+        try {
+          const doc = await getDb().collection('order_recipients').doc(r.order_sn).get();
+          return { order_sn: r.order_sn, firestore_persisted: doc.exists, source: doc.data()?.source ?? null };
+        } catch { return { order_sn: r.order_sn, firestore_persisted: false }; }
+      }));
+
+      // ── 4. Diagnosis ───────────────────────────────────────────────────────
+      const utcGap = Math.round(shopeeTotal - bqTotalUtc);
+      const wibGap = Math.round(shopeeTotal - bqTotalWib);
+      const suspectedIssue = bqDateMismatch.length > 0
+        ? `backfill_date_corruption — ${bqDateMismatch.length} orders found in BQ but stamped with wrong wib_date (${bqDateMismatch[0]?.stored_wib_date ?? '?'} instead of ${targetDate}); fetchEscrowDetail used sync time not release time`
+        : Math.abs(wibGap) < 1000 ? 'none — totals match'
+        : bqRows.length === 0 ? 'sync_gap — orders not in shopee_order_finance at all; run escrow-list sync'
+        : Math.abs(wibGap) < Math.abs(utcGap) && Math.abs(utcGap) > 10000
+          ? 'timezone — use AT TIME ZONE Asia/Jakarta'
+          : 'unknown — inspect bq_raw_rows';
+
+      return res.status(200).json({
+        target_date_wib:    targetDate,
+        shop_id_used:       safeShop,
+        table_stats:        tableStats,
+        shopee_api_total:   Math.round(shopeeTotal),
+        shopee_row_count:   shopeeRows.length,
+        bigquery_utc_total: Math.round(bqTotalUtc),
+        bigquery_wib_total: Math.round(bqTotalWib),
+        bigquery_utc_rows:  bqRowCountUtc,
+        bigquery_wib_rows:  bqRowCountWib,
+        utc_gap:            utcGap,
+        wib_gap:            wibGap,
+        lookup_note:        `Rows looked up by order_sn (not date). bq_date_mismatch shows orders found but with wrong completed_date — confirms backfill corruption.`,
+        last_bq_sync:       lastSyncedAt,
+        webhook_persistence: webhookChecks,
+        suspected_issue:    suspectedIssue,
+        bq_date_mismatch:   bqDateMismatch.slice(0, 10),
+        shopee_raw_rows:    shopeeRows,
+        bq_raw_rows:        bqRows,
+      });
+    } catch (err) {
+      console.error('[debug-finance] error:', err.message);
       return res.status(500).json({ error: err.message });
     }
   }
